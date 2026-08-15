@@ -1,45 +1,43 @@
-# [Project name]
+# Bot de Inventário para Discord
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Bot em Python com `discord.py` que controla inventário por servidor usando comandos slash e mantém os dados em SQLite.
 
-## Run & Operate
+## Executar
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `python main.py` — inicia o bot
+- `python -m unittest -v test_inventory_store.py` — executa os testes da persistência
+- Segredo necessário: `DISCORD_TOKEN`
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.11
+- Discord API via `discord.py`
+- SQLite com transações, foreign keys e WAL
 
-## Where things live
+## Onde ficam as coisas
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `main.py` — cliente Discord e comandos slash
+- `inventory_store.py` — schema SQLite e operações transacionais
+- `test_inventory_store.py` — testes da camada de persistência
+- `data/inventory.sqlite3` — banco criado automaticamente em runtime
 
-## Architecture decisions
+## Decisões
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- O estoque é separado por `guild_id`, evitando que servidores diferentes compartilhem dados.
+- Item é comparado por nome normalizado, mas mantém a primeira grafia usada para exibição.
+- Retiradas são transacionais e nunca podem levar o saldo abaixo de zero.
+- O token é lido exclusivamente do segredo `DISCORD_TOKEN`.
 
-## Product
+## Produto
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Os comandos `/estoque`, `/adicionar`, `/retirar` e `/historico` permitem consultar,
+movimentar e auditar o inventário diretamente no Discord.
 
-## User preferences
+## Preferências do usuário
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Não criar website.
 
-## Gotchas
+## Cuidados
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- O segredo `DISCORD_TOKEN` precisa existir antes de iniciar o bot.
+- O convite do bot precisa incluir os escopos `bot` e `applications.commands`.
