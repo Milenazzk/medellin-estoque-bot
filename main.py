@@ -46,10 +46,24 @@ class InventoryBot(commands.Bot):
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
         self.store = InventoryStore(DATABASE_PATH)
+        self.commands_synced = False
 
-    async def setup_hook(self) -> None:
-        await self.tree.sync()
-        logger.info("Slash commands synced globally.")
+    async def sync_slash_commands(self) -> None:
+        """Sync global commands and copy them to every guild for immediate visibility."""
+        global_commands = await self.tree.sync()
+        guild_command_total = 0
+
+        for guild in self.guilds:
+            self.tree.copy_global_to(guild=guild)
+            guild_commands = await self.tree.sync(guild=guild)
+            guild_command_total += len(guild_commands)
+
+        logger.info(
+            "Slash commands synced: %d globally and %d across %d guild(s).",
+            len(global_commands),
+            guild_command_total,
+            len(self.guilds),
+        )
 
     async def close(self) -> None:
         self.store.close()
@@ -63,6 +77,27 @@ bot = InventoryBot()
 async def on_ready() -> None:
     if bot.user is not None:
         logger.info("Connected as %s (%s)", bot.user, bot.user.id)
+    if not bot.commands_synced:
+        try:
+            await bot.sync_slash_commands()
+            bot.commands_synced = True
+        except discord.DiscordException:
+            logger.exception("Could not sync slash commands during on_ready.")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    """Sync commands immediately when the bot is added to a new server."""
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        guild_commands = await bot.tree.sync(guild=guild)
+        logger.info(
+            "Slash commands synced to new guild %s: %d command(s).",
+            guild.id,
+            len(guild_commands),
+        )
+    except discord.DiscordException:
+        logger.exception("Could not sync slash commands to guild %s.", guild.id)
 
 
 def require_guild(interaction: discord.Interaction) -> Optional[discord.Embed]:
