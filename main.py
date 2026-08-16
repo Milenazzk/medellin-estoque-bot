@@ -49,8 +49,16 @@ class InventoryBot(commands.Bot):
         self.commands_synced = False
 
     async def sync_slash_commands(self) -> None:
-        """Sync global commands and copy them to every guild for immediate visibility."""
-        global_commands = await self.tree.sync()
+        """Clear global commands and sync one copy to each guild."""
+        command_definitions = self.tree.get_commands()
+        self.tree.clear_commands(guild=None)
+        cleared_global_commands = await self.tree.sync()
+
+        # Keep the local definitions available for guild-specific syncs and
+        # for future guild joins, without publishing another global copy.
+        for command in command_definitions:
+            self.tree.add_command(command)
+
         guild_command_total = 0
 
         for guild in self.guilds:
@@ -59,8 +67,9 @@ class InventoryBot(commands.Bot):
             guild_command_total += len(guild_commands)
 
         logger.info(
-            "Slash commands synced: %d globally and %d across %d guild(s).",
-            len(global_commands),
+            "Slash commands synced: global registry cleared (%d remaining); "
+            "%d across %d guild(s).",
+            len(cleared_global_commands),
             guild_command_total,
             len(self.guilds),
         )
