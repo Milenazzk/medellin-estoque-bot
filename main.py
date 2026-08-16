@@ -27,6 +27,7 @@ logger = logging.getLogger("inventory-bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_PATH = os.getenv("INVENTORY_DATABASE", "data/inventory.sqlite3")
+MEDELLIN_RED = discord.Color(0x7A1F1F)
 
 
 def format_quantity(quantity: int) -> str:
@@ -48,10 +49,17 @@ class InventoryBot(commands.Bot):
         self.store = InventoryStore(DATABASE_PATH)
         self.commands_synced = False
 
+    async def setup_hook(self) -> None:
+        # The view has custom IDs and no timeout, so Discord can route button
+        # clicks to it even after this process has restarted.
+        self.add_view(InventoryPanelView(self))
+        logger.info("Persistent inventory panel view registered.")
+
     async def sync_slash_commands(self) -> None:
         """Clear global commands and sync one copy to each guild."""
         command_definitions = self.tree.get_commands()
         self.tree.clear_commands(guild=None)
+        logger.info("Clearing global slash commands.")
         cleared_global_commands = await self.tree.sync()
 
         # Keep the local definitions available for guild-specific syncs and
@@ -62,6 +70,7 @@ class InventoryBot(commands.Bot):
         guild_command_total = 0
 
         for guild in self.guilds:
+            logger.info("Syncing slash commands to guild %s.", guild.id)
             self.tree.copy_global_to(guild=guild)
             guild_commands = await self.tree.sync(guild=guild)
             guild_command_total += len(guild_commands)
@@ -80,6 +89,232 @@ class InventoryBot(commands.Bot):
 
 
 bot = InventoryBot()
+
+
+def build_inventory_embed(guild_id: int) -> discord.Embed:
+    records = bot.store.list_items(guild_id)
+    embed = discord.Embed(title="📦 ESTOQUE • MEDELLÍN", color=MEDELLIN_RED)
+    embed.set_footer(text="Use os botões abaixo para movimentar o estoque")
+
+    if not records:
+        embed.description = "📦 O estoque está vazio."
+        return embed
+
+    lines = [
+        f"**{record['name']}** — **{format_quantity(record['quantity'])}**"
+        for record in records
+    ]
+    description = "\n".join(lines)
+    if len(description) > 3900:
+        description = description[:3890].rsplit("\n", 1)[0] + "\n…"
+    embed.description = description
+    return embed
+
+
+def build_history_embed(guild_id: int, limit: int = 10) -> discord.Embed:
+    records = bot.store.list_history(guild_id, limit=limit)
+    embed = discord.Embed(title="📋 HISTÓRICO • MEDELLÍN", color=MEDELLIN_RED)
+    embed.set_footer(text="Últimas movimentações do servidor")
+
+    if not records:
+        embed.description = "Nenhuma movimentação foi registrada ainda."
+        return embed
+
+    lines = []
+    for record in records:
+        action = "Entrada" if record["action"] == "add" else "Saída"
+        sign = "+" if record["action"] == "add" else "-"
+        lines.append(
+            f"**{action}** · **{record['item_name']}** · "
+            f"{sign}{format_quantity(record['quantity'])} unidade(s)\n"
+            f"Usuário: {record['user_name']} · "
+            f"{format_timestamp(record['created_at'])}"
+        )
+    embed.description = "\n\n".join(lines)
+    return embed
+
+
+def parse_modal_quantity(value: str) -> int:
+    try:
+        return int(value.strip())
+    except ValueError as error:
+        raise InventoryError("A quantidade deve ser um número inteiro.") from error
+
+
+class AddStockModal(discord.ui.Modal, title="➕ Adicionar ao estoque"):
+    item_name = discord.ui.TextInput(
+        label="Nome do item",
+        placeholder="Ex.: Café Medellín",
+        min_length=1,
+        max_length=100,
+        required=True,
+    )
+    quantity = discord.ui.TextInput(
+        label="Quantidade",
+        placeholder="Ex.: 10",
+        min_length=1,
+        max_length=10,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Este painel só pode ser usado dentro de um servidor.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            quantity = parse_modal_quantity(str(self.quantity.value))
+            record = bot.store.add_stock(
+                guild_id=interaction.guild_id,
+                item_name=str(self.item_name.value),
+                quantity=quantity,
+                user_id=interaction.user.id,
+                user_name=str(interaction.user),
+            )
+        except InventoryError as error:
+            embed = discord.Embed(
+                title="Não foi possível adicionar",
+                description=str(error),
+                color=discord.Color.red(),
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        embed = discord.Embed(title="Estoque atualizado", color=discord.Color.green())
+        embed.description = (
+            f"Foram adicionadas **{format_quantity(quantity)}** unidade(s) de "
+            f"**{record['name']}**.\nSaldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class RemoveStockModal(discord.ui.Modal, title="➖ Retirar do estoque"):
+    item_name = discord.ui.TextInput(
+        label="Nome do item",
+        placeholder="Ex.: Café Medellín",
+        min_length=1,
+        max_length=100,
+        required=True,
+    )
+    quantity = discord.ui.TextInput(
+        label="Quantidade",
+        placeholder="Ex.: 3",
+        min_length=1,
+        max_length=10,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Este painel só pode ser usado dentro de um servidor.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            quantity = parse_modal_quantity(str(self.quantity.value))
+            record = bot.store.remove_stock(
+                guild_id=interaction.guild_id,
+                item_name=str(self.item_name.value),
+                quantity=quantity,
+                user_id=interaction.user.id,
+                user_name=str(interaction.user),
+            )
+        except (InsufficientStockError, ItemNotFoundError, InventoryError) as error:
+            embed = discord.Embed(
+                title="Não foi possível retirar",
+                description=str(error),
+                color=discord.Color.red(),
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        embed = discord.Embed(title="Estoque atualizado", color=discord.Color.green())
+        embed.description = (
+            f"Foram retiradas **{format_quantity(quantity)}** unidade(s) de "
+            f"**{record['name']}**.\nSaldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class InventoryPanelView(discord.ui.View):
+    def __init__(self, inventory_bot: InventoryBot) -> None:
+        super().__init__(timeout=None)
+        self.inventory_bot = inventory_bot
+
+    @discord.ui.button(
+        label="Adicionar",
+        emoji="➕",
+        style=discord.ButtonStyle.success,
+        custom_id="inventory_panel:add",
+    )
+    async def add_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        await interaction.response.send_modal(AddStockModal())
+
+    @discord.ui.button(
+        label="Retirar",
+        emoji="➖",
+        style=discord.ButtonStyle.danger,
+        custom_id="inventory_panel:remove",
+    )
+    async def remove_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        await interaction.response.send_modal(RemoveStockModal())
+
+    @discord.ui.button(
+        label="Histórico",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="inventory_panel:history",
+    )
+    async def history_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Este painel só pode ser usado dentro de um servidor.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            embed=build_history_embed(interaction.guild_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Atualizar",
+        emoji="🔄",
+        style=discord.ButtonStyle.primary,
+        custom_id="inventory_panel:refresh",
+    )
+    async def refresh_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Este painel só pode ser usado dentro de um servidor.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.edit_message(
+            embed=build_inventory_embed(interaction.guild_id),
+            view=InventoryPanelView(self.inventory_bot),
+        )
 
 
 @bot.event
@@ -142,25 +377,8 @@ async def estoque(
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        embed = discord.Embed(title="Consulta de estoque", color=discord.Color.blurple())
-        embed.add_field(name=record["name"], value=f"**{format_quantity(record['quantity'])}** unidade(s)")
-        embed.set_footer(text="Inventário separado por servidor")
-        await interaction.response.send_message(embed=embed)
-        return
-
-    records = bot.store.list_items(interaction.guild_id)
-    embed = discord.Embed(title="Estoque atual", color=discord.Color.blurple())
-    embed.set_footer(text="Inventário separado por servidor")
-
-    if not records:
-        embed.description = "O estoque está vazio. Use `/adicionar` para cadastrar o primeiro item."
-    else:
-        embed.description = "\n".join(
-            f"**{record['name']}** — {format_quantity(record['quantity'])} unidade(s)"
-            for record in records
-        )
-
-    await interaction.response.send_message(embed=embed)
+    embed = build_inventory_embed(interaction.guild_id)
+    await interaction.response.send_message(embed=embed, view=InventoryPanelView(bot))
 
 
 @bot.tree.command(name="adicionar", description="Adiciona unidades ao estoque.")
@@ -193,7 +411,7 @@ async def adicionar(interaction: discord.Interaction, item: str, quantidade: int
         f"Foram adicionadas **{format_quantity(quantidade)}** unidade(s) de **{record['name']}**.\n"
         f"Saldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="retirar", description="Retira unidades do estoque.")
@@ -230,7 +448,7 @@ async def retirar(interaction: discord.Interaction, item: str, quantidade: int) 
         f"Foram retiradas **{format_quantity(quantidade)}** unidade(s) de **{record['name']}**.\n"
         f"Saldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="historico", description="Consulta as últimas movimentações do estoque.")
@@ -266,7 +484,7 @@ async def historico(
             )
         embed.description = "\n\n".join(lines)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 if not TOKEN:
