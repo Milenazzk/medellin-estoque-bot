@@ -57,6 +57,18 @@ class InventoryStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_item(1, "Caderno")["quantity"], 3)
         self.assertEqual(self.store.get_item(2, "Caderno")["quantity"], 8)
 
+    def test_custom_categories_are_persisted_and_shown_in_history(self) -> None:
+        self.store.add_stock(123, "MTAR", 20, 1, "Ana", category="Armas")
+        self.store.remove_stock(123, "MTAR", 5, 2, "Bruno")
+
+        item = self.store.get_item(123, "MTAR")
+        self.assertEqual(item["category"], "Armas")
+        self.assertEqual(item["quantity"], 15)
+
+        history = self.store.list_history(123)
+        self.assertEqual(history[0]["category"], "Armas")
+        self.assertEqual(history[1]["category"], "Armas")
+
 
 if __name__ == "__main__":
     unittest.main()

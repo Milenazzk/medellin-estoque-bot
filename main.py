@@ -48,6 +48,7 @@ class InventoryBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.store = InventoryStore(DATABASE_PATH)
         self.commands_synced = False
+        self.panel_messages: dict[int, tuple[int, int]] = {}
 
     async def setup_hook(self) -> None:
         # The view has custom IDs and no timeout, so Discord can route button
@@ -87,8 +88,43 @@ class InventoryBot(commands.Bot):
         self.store.close()
         await super().close()
 
+    def remember_panel(self, guild_id: int, message: discord.Message) -> None:
+        self.panel_messages[guild_id] = (message.channel.id, message.id)
+
+    async def refresh_inventory_panel(self, guild_id: int) -> None:
+        panel_reference = self.panel_messages.get(guild_id)
+        if panel_reference is None:
+            return
+
+        channel_id, message_id = panel_reference
+        try:
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(channel_id)
+            message = await channel.fetch_message(message_id)
+            await message.edit(
+                embed=build_inventory_embed(guild_id),
+                view=InventoryPanelView(self),
+            )
+        except discord.DiscordException:
+            logger.warning(
+                "Could not refresh inventory panel for guild %s.",
+                guild_id,
+                exc_info=True,
+            )
 
 bot = InventoryBot()
+
+
+def category_emoji(category: str) -> str:
+    normalized = category.casefold()
+    if normalized in {"armas", "arma"}:
+        return "🔫"
+    if normalized in {"munições", "municao", "municoes"}:
+        return "📦"
+    if normalized in {"materiais", "material"}:
+        return "🧱"
+    return "📁"
 
 
 def build_inventory_embed(guild_id: int) -> discord.Embed:
@@ -100,10 +136,23 @@ def build_inventory_embed(guild_id: int) -> discord.Embed:
         embed.description = "📦 O estoque está vazio."
         return embed
 
-    lines = [
-        f"**{record['name']}** — **{format_quantity(record['quantity'])}**"
-        for record in records
-    ]
+    grouped: dict[str, dict[str, object]] = {}
+    for record in records:
+        key = str(record["category"]).casefold()
+        if key not in grouped:
+            grouped[key] = {"name": record["category"], "items": []}
+        grouped[key]["items"].append(record)  # type: ignore[union-attr]
+
+    lines = []
+    for group in grouped.values():
+        category = str(group["name"])
+        lines.append(f"**{category_emoji(category)} {category.upper()}**")
+        lines.extend(
+            f"{record['name']} — **{format_quantity(record['quantity'])}**"
+            for record in group["items"]  # type: ignore[union-attr]
+        )
+        lines.append("")
+
     description = "\n".join(lines)
     if len(description) > 3900:
         description = description[:3890].rsplit("\n", 1)[0] + "\n…"
@@ -111,8 +160,12 @@ def build_inventory_embed(guild_id: int) -> discord.Embed:
     return embed
 
 
-def build_history_embed(guild_id: int, limit: int = 10) -> discord.Embed:
-    records = bot.store.list_history(guild_id, limit=limit)
+def build_history_embed(
+    guild_id: int,
+    item_name: Optional[str] = None,
+    limit: int = 10,
+) -> discord.Embed:
+    records = bot.store.list_history(guild_id, item_name=item_name, limit=limit)
     embed = discord.Embed(title="📋 HISTÓRICO • MEDELLÍN", color=MEDELLIN_RED)
     embed.set_footer(text="Últimas movimentações do servidor")
 
@@ -125,7 +178,7 @@ def build_history_embed(guild_id: int, limit: int = 10) -> discord.Embed:
         action = "Entrada" if record["action"] == "add" else "Saída"
         sign = "+" if record["action"] == "add" else "-"
         lines.append(
-            f"**{action}** · **{record['item_name']}** · "
+            f"**{action}** · **{record['category']}** · **{record['item_name']}** · "
             f"{sign}{format_quantity(record['quantity'])} unidade(s)\n"
             f"Usuário: {record['user_name']} · "
             f"{format_timestamp(record['created_at'])}"
@@ -142,9 +195,16 @@ def parse_modal_quantity(value: str) -> int:
 
 
 class AddStockModal(discord.ui.Modal, title="➕ Adicionar ao estoque"):
+    category = discord.ui.TextInput(
+        label="Categoria",
+        placeholder="Ex.: Armas, Munições, Materiais",
+        min_length=1,
+        max_length=100,
+        required=True,
+    )
     item_name = discord.ui.TextInput(
         label="Nome do item",
-        placeholder="Ex.: Café Medellín",
+        placeholder="Ex.: MTAR",
         min_length=1,
         max_length=100,
         required=True,
@@ -173,6 +233,7 @@ class AddStockModal(discord.ui.Modal, title="➕ Adicionar ao estoque"):
                 quantity=quantity,
                 user_id=interaction.user.id,
                 user_name=str(interaction.user),
+                category=str(self.category.value),
             )
         except InventoryError as error:
             embed = discord.Embed(
@@ -186,9 +247,11 @@ class AddStockModal(discord.ui.Modal, title="➕ Adicionar ao estoque"):
         embed = discord.Embed(title="Estoque atualizado", color=discord.Color.green())
         embed.description = (
             f"Foram adicionadas **{format_quantity(quantity)}** unidade(s) de "
-            f"**{record['name']}**.\nSaldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
+            f"**{record['name']}** em **{record['category']}**.\n"
+            f"Saldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        await bot.refresh_inventory_panel(interaction.guild_id)
 
 
 class RemoveStockModal(discord.ui.Modal, title="➖ Retirar do estoque"):
@@ -236,9 +299,11 @@ class RemoveStockModal(discord.ui.Modal, title="➖ Retirar do estoque"):
         embed = discord.Embed(title="Estoque atualizado", color=discord.Color.green())
         embed.description = (
             f"Foram retiradas **{format_quantity(quantity)}** unidade(s) de "
-            f"**{record['name']}**.\nSaldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
+            f"**{record['name']}** em **{record['category']}**.\n"
+            f"Saldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        await bot.refresh_inventory_panel(interaction.guild_id)
 
 
 class InventoryPanelView(discord.ui.View):
@@ -257,6 +322,8 @@ class InventoryPanelView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button[discord.ui.View],
     ) -> None:
+        if interaction.guild_id is not None and interaction.message is not None:
+            bot.remember_panel(interaction.guild_id, interaction.message)
         await interaction.response.send_modal(AddStockModal())
 
     @discord.ui.button(
@@ -270,6 +337,8 @@ class InventoryPanelView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button[discord.ui.View],
     ) -> None:
+        if interaction.guild_id is not None and interaction.message is not None:
+            bot.remember_panel(interaction.guild_id, interaction.message)
         await interaction.response.send_modal(RemoveStockModal())
 
     @discord.ui.button(
@@ -289,6 +358,8 @@ class InventoryPanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if interaction.message is not None:
+            bot.remember_panel(interaction.guild_id, interaction.message)
         await interaction.response.send_message(
             embed=build_history_embed(interaction.guild_id),
             ephemeral=True,
@@ -311,6 +382,8 @@ class InventoryPanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if interaction.message is not None:
+            bot.remember_panel(interaction.guild_id, interaction.message)
         await interaction.response.edit_message(
             embed=build_inventory_embed(interaction.guild_id),
             view=InventoryPanelView(self.inventory_bot),
@@ -379,6 +452,8 @@ async def estoque(
 
     embed = build_inventory_embed(interaction.guild_id)
     await interaction.response.send_message(embed=embed, view=InventoryPanelView(bot))
+    panel_message = await interaction.original_response()
+    bot.remember_panel(interaction.guild_id, panel_message)
 
 
 @bot.tree.command(name="adicionar", description="Adiciona unidades ao estoque.")
@@ -409,9 +484,11 @@ async def adicionar(interaction: discord.Interaction, item: str, quantidade: int
     embed = discord.Embed(title="Estoque atualizado", color=discord.Color.green())
     embed.description = (
         f"Foram adicionadas **{format_quantity(quantidade)}** unidade(s) de **{record['name']}**.\n"
+        f"Categoria: **{record['category']}** · "
         f"Saldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    await bot.refresh_inventory_panel(interaction.guild_id)
 
 
 @bot.tree.command(name="retirar", description="Retira unidades do estoque.")
@@ -446,9 +523,11 @@ async def retirar(interaction: discord.Interaction, item: str, quantidade: int) 
     embed = discord.Embed(title="Estoque atualizado", color=discord.Color.green())
     embed.description = (
         f"Foram retiradas **{format_quantity(quantidade)}** unidade(s) de **{record['name']}**.\n"
+        f"Categoria: **{record['category']}** · "
         f"Saldo atual: **{format_quantity(record['quantity'])}** unidade(s)."
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    await bot.refresh_inventory_panel(interaction.guild_id)
 
 
 @bot.tree.command(name="historico", description="Consulta as últimas movimentações do estoque.")
@@ -467,24 +546,14 @@ async def historico(
         return
 
     assert interaction.guild_id is not None
-    records = bot.store.list_history(interaction.guild_id, item_name=item, limit=limite)
-    embed = discord.Embed(title="Histórico de movimentações", color=discord.Color.blurple())
-
-    if not records:
-        embed.description = "Nenhuma movimentação foi registrada ainda."
-    else:
-        lines = []
-        for record in records:
-            action = "Entrada" if record["action"] == "add" else "Saída"
-            sign = "+" if record["action"] == "add" else "-"
-            lines.append(
-                f"**{action}** {sign}{format_quantity(record['quantity'])} × **{record['item_name']}**\n"
-                f"Saldo: {format_quantity(record['balance_after'])} · "
-                f"{record['user_name']} · {format_timestamp(record['created_at'])}"
-            )
-        embed.description = "\n\n".join(lines)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(
+        embed=build_history_embed(
+            interaction.guild_id,
+            item_name=item,
+            limit=limite,
+        ),
+        ephemeral=True,
+    )
 
 
 if not TOKEN:

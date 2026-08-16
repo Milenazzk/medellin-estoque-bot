@@ -9,6 +9,9 @@ from threading import RLock
 from typing import Any, Optional
 
 
+LEGACY_CATEGORY = "Sem categoria"
+
+
 class InventoryError(ValueError):
     """Base error for invalid inventory operations."""
 
@@ -41,6 +44,7 @@ class InventoryStore:
                 CREATE TABLE IF NOT EXISTS inventory_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'Sem categoria',
                     name TEXT NOT NULL,
                     normalized_name TEXT NOT NULL,
                     quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
@@ -53,6 +57,7 @@ class InventoryStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
                     item_id INTEGER NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'Sem categoria',
                     item_name TEXT NOT NULL,
                     normalized_item_name TEXT NOT NULL,
                     action TEXT NOT NULL CHECK (action IN ('add', 'remove')),
@@ -71,10 +76,33 @@ class InventoryStore:
 
             # Kept as a separate additive migration so existing databases can be
             # upgraded without deleting their inventory or movement history.
+            item_columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(inventory_items)")
+            }
+            if "category" not in item_columns:
+                self.connection.execute(
+                    "ALTER TABLE inventory_items ADD COLUMN category TEXT NOT NULL DEFAULT 'Sem categoria'"
+                )
+
             columns = {
                 row["name"]
                 for row in self.connection.execute("PRAGMA table_info(inventory_movements)")
             }
+            if "category" not in columns:
+                self.connection.execute(
+                    "ALTER TABLE inventory_movements ADD COLUMN category TEXT NOT NULL DEFAULT 'Sem categoria'"
+                )
+                self.connection.execute(
+                    """
+                    UPDATE inventory_movements
+                    SET category = COALESCE(
+                        (SELECT category FROM inventory_items WHERE inventory_items.id = inventory_movements.item_id),
+                        'Sem categoria'
+                    )
+                    WHERE category = 'Sem categoria'
+                    """
+                )
             if "normalized_item_name" not in columns:
                 self.connection.execute(
                     "ALTER TABLE inventory_movements ADD COLUMN normalized_item_name TEXT NOT NULL DEFAULT ''"
@@ -112,6 +140,15 @@ class InventoryStore:
         return name
 
     @staticmethod
+    def display_category(category: str) -> str:
+        value = " ".join(category.strip().split())
+        if not value:
+            raise InventoryError("A categoria não pode ficar vazia.")
+        if len(value) > 100:
+            raise InventoryError("A categoria deve ter no máximo 100 caracteres.")
+        return value
+
+    @staticmethod
     def validate_quantity(quantity: int) -> None:
         if quantity <= 0:
             raise InventoryError("A quantidade deve ser maior que zero.")
@@ -123,7 +160,7 @@ class InventoryStore:
         with self.lock:
             row = self.connection.execute(
                 """
-                SELECT id, guild_id, name, quantity, created_at, updated_at
+                SELECT id, guild_id, category, name, quantity, created_at, updated_at
                 FROM inventory_items
                 WHERE guild_id = ? AND normalized_name = ?
                 """,
@@ -135,10 +172,10 @@ class InventoryStore:
         with self.lock:
             rows = self.connection.execute(
                 """
-                SELECT id, guild_id, name, quantity, created_at, updated_at
+                SELECT id, guild_id, category, name, quantity, created_at, updated_at
                 FROM inventory_items
                 WHERE guild_id = ?
-                ORDER BY lower(name) ASC
+                ORDER BY lower(category) ASC, lower(name) ASC
                 """,
                 (guild_id,),
             ).fetchall()
@@ -151,16 +188,20 @@ class InventoryStore:
         quantity: int,
         user_id: int,
         user_name: str,
+        category: Optional[str] = None,
     ) -> dict[str, Any]:
         self.validate_quantity(quantity)
         name = self.display_name(item_name)
         normalized = self.normalize_name(name)
+        requested_category = (
+            self.display_category(category) if category is not None else None
+        )
         timestamp = self._timestamp()
 
         with self.lock, self.connection:
             row = self.connection.execute(
                 """
-                SELECT id, name, quantity
+                SELECT id, category, name, quantity
                 FROM inventory_items
                 WHERE guild_id = ? AND normalized_name = ?
                 """,
@@ -169,25 +210,35 @@ class InventoryStore:
 
             if row:
                 new_quantity = row["quantity"] + quantity
+                stored_category = requested_category or row["category"]
                 self.connection.execute(
                     """
                     UPDATE inventory_items
-                    SET quantity = ?, updated_at = ?
+                    SET category = ?, quantity = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (new_quantity, timestamp, row["id"]),
+                    (stored_category, new_quantity, timestamp, row["id"]),
                 )
                 item_id = row["id"]
                 stored_name = row["name"]
             else:
                 new_quantity = quantity
+                stored_category = requested_category or LEGACY_CATEGORY
                 cursor = self.connection.execute(
                     """
                     INSERT INTO inventory_items
-                        (guild_id, name, normalized_name, quantity, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (guild_id, category, name, normalized_name, quantity, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (guild_id, name, normalized, quantity, timestamp, timestamp),
+                    (
+                        guild_id,
+                        stored_category,
+                        name,
+                        normalized,
+                        quantity,
+                        timestamp,
+                        timestamp,
+                    ),
                 )
                 item_id = cursor.lastrowid
                 stored_name = name
@@ -195,6 +246,7 @@ class InventoryStore:
             self._record_movement(
                 guild_id=guild_id,
                 item_id=item_id,
+                category=stored_category,
                 item_name=stored_name,
                 normalized_item_name=normalized,
                 action="add",
@@ -205,7 +257,12 @@ class InventoryStore:
                 created_at=timestamp,
             )
 
-        return {"id": item_id, "name": stored_name, "quantity": new_quantity}
+        return {
+            "id": item_id,
+            "category": stored_category,
+            "name": stored_name,
+            "quantity": new_quantity,
+        }
 
     def remove_stock(
         self,
@@ -222,7 +279,7 @@ class InventoryStore:
         with self.lock, self.connection:
             row = self.connection.execute(
                 """
-                SELECT id, name, quantity
+                SELECT id, category, name, quantity
                 FROM inventory_items
                 WHERE guild_id = ? AND normalized_name = ?
                 """,
@@ -249,6 +306,7 @@ class InventoryStore:
             self._record_movement(
                 guild_id=guild_id,
                 item_id=row["id"],
+                category=row["category"],
                 item_name=row["name"],
                 normalized_item_name=normalized,
                 action="remove",
@@ -259,7 +317,12 @@ class InventoryStore:
                 created_at=timestamp,
             )
 
-        return {"id": row["id"], "name": row["name"], "quantity": new_quantity}
+        return {
+            "id": row["id"],
+            "category": row["category"],
+            "name": row["name"],
+            "quantity": new_quantity,
+        }
 
     def list_history(
         self,
@@ -275,7 +338,7 @@ class InventoryStore:
                 normalized = self.normalize_name(item_name)
                 rows = self.connection.execute(
                     """
-                    SELECT item_name, action, quantity, balance_after, user_name, created_at
+                    SELECT category, item_name, action, quantity, balance_after, user_name, created_at
                     FROM inventory_movements
                     WHERE guild_id = ? AND normalized_item_name = ?
                     ORDER BY id DESC
@@ -286,7 +349,7 @@ class InventoryStore:
             else:
                 rows = self.connection.execute(
                     """
-                    SELECT item_name, action, quantity, balance_after, user_name, created_at
+                    SELECT category, item_name, action, quantity, balance_after, user_name, created_at
                     FROM inventory_movements
                     WHERE guild_id = ?
                     ORDER BY id DESC
@@ -300,6 +363,7 @@ class InventoryStore:
         self,
         guild_id: int,
         item_id: int,
+        category: str,
         item_name: str,
         normalized_item_name: str,
         action: str,
@@ -312,13 +376,14 @@ class InventoryStore:
         self.connection.execute(
             """
             INSERT INTO inventory_movements
-                (guild_id, item_id, item_name, normalized_item_name, action,
+                (guild_id, item_id, category, item_name, normalized_item_name, action,
                  quantity, balance_after, user_id, user_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id,
                 item_id,
+                category,
                 item_name,
                 normalized_item_name,
                 action,
